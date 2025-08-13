@@ -3,7 +3,7 @@ import json
 import asyncio
 from typing import Dict, Any, Optional, List
 from datetime import datetime
-from mcp_client import MCPClient, create_mcp_client, extract_mcp_response_text
+from mcp_client import MCPClient, create_mcp_client, extract_mcp_response_text, MCPServerManager
 from llm_connector import create_llm_connector
 
 st.set_page_config(
@@ -16,7 +16,9 @@ st.set_page_config(
 if 'chat_messages' not in st.session_state:
     st.session_state.chat_messages = []
 if 'mcp_client' not in st.session_state:
-    st.session_state.mcp_client = None
+    st.session_state.mcp_client = None  # Legacy single server support
+if 'mcp_manager' not in st.session_state:
+    st.session_state.mcp_manager = MCPServerManager()  # Multi-server support
 if 'session_token' not in st.session_state:
     st.session_state.session_token = None
 if 'available_tools' not in st.session_state:
@@ -29,6 +31,8 @@ if 'processing_steps' not in st.session_state:
     st.session_state.processing_steps = []
 if 'current_user_input' not in st.session_state:
     st.session_state.current_user_input = None
+if 'show_add_server' not in st.session_state:
+    st.session_state.show_add_server = False
 
 # Sidebar for configuration and navigation
 with st.sidebar:
@@ -45,71 +49,103 @@ with st.sidebar:
     
     st.divider()
     
-    # MCP Server Configuration
-    st.subheader("MCP Server")
-    server_url = st.text_input(
-        "Server URL",
-        value="http://host.docker.internal:8080",
-        help="MCP server endpoint"
-    )
+    # Multi-MCP Server Configuration
+    st.subheader("🔧 MCP Servers")
     
-    # Authentication
-    st.subheader("Authentication")
-    auth_method = st.selectbox(
-        "Method",
-        ["None", "Session-based"]
-    )
+    # Add/Connect to MCP Server (single form)
+    if st.button("➕ Add MCP Server"):
+        st.session_state.show_add_server = not st.session_state.show_add_server
     
-    if auth_method == "Session-based":
-        with st.expander("Login Credentials", expanded=True):
-            username = st.text_input("Username")
-            password = st.text_input("Password", type="password")
-            auth_server = st.text_input("Auth Server", value="server.company.com")
-            auth_port = st.text_input("Port", value="443")
+    if st.session_state.show_add_server:
+        st.write("**Add & Connect to MCP Server**")
+        
+        # Authentication type selection outside form for immediate reactivity
+        new_auth_type = st.selectbox("Authentication", ["none", "session"], key="auth_type_select")
+        
+        with st.form("add_server_form"):
+            new_server_name = st.text_input("Server Name", help="Friendly name for this server")
+            new_server_url = st.text_input("Server URL", value="http://host.docker.internal:8080")
+            
+            # Show authentication fields for session auth
+            if new_auth_type == "session":
+                st.write("**Authentication Details**")
+                new_username = st.text_input("Username", key="add_username")
+                new_password = st.text_input("Password", type="password", key="add_password")
+                new_auth_server = st.text_input("Auth Server", key="add_auth_server")
+                new_auth_port = st.text_input("Auth Port", value="443", key="add_auth_port")
+            else:
+                new_username = new_password = new_auth_server = new_auth_port = None
             
             col1, col2 = st.columns(2)
             with col1:
-                if st.button("🔐 Login", disabled=not (username and password and auth_server)):
-                    async def login():
-                        try:
-                            client = create_mcp_client(server_url)
-                            session_token = await client.login(username, password, auth_server, auth_port)
-                            st.session_state.mcp_client = client
-                            st.session_state.session_token = session_token
-                            
-                            # Load available tools
-                            tools = await client.list_tools()
-                            st.session_state.available_tools = tools
-                            
-                            st.success("✅ Login successful!")
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"❌ Login failed: {str(e)}")
-                    
-                    asyncio.run(login())
+                if st.form_submit_button("Add & Connect"):
+                    if new_server_name and new_server_url:
+                        # Validate required fields for session auth
+                        if new_auth_type == "session" and (not new_username or not new_password or not new_auth_server):
+                            st.error("Please provide username, password, and auth server for session authentication")
+                        else:
+                            async def add_and_connect_server():
+                                try:
+                                    # Add server
+                                    server_id = await st.session_state.mcp_manager.add_server(
+                                        new_server_name, new_server_url, new_auth_type
+                                    )
+                                    
+                                    # Connect immediately
+                                    if new_auth_type == "session":
+                                        await st.session_state.mcp_manager.connect_server(
+                                            server_id, new_username, new_password, new_auth_server, new_auth_port
+                                        )
+                                    else:
+                                        await st.session_state.mcp_manager.connect_server(server_id)
+                                    
+                                    st.success(f"✅ Added and connected to {new_server_name}!")
+                                    st.session_state.show_add_server = False
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"❌ Failed to add/connect server: {str(e)}")
+                            asyncio.run(add_and_connect_server())
+                    else:
+                        st.error("Please provide server name and URL")
             
             with col2:
-                if st.button("🔓 Logout", disabled=not st.session_state.session_token):
-                    async def logout():
-                        if st.session_state.mcp_client:
-                            await st.session_state.mcp_client.logout()
-                        st.session_state.mcp_client = None
-                        st.session_state.session_token = None
-                        st.session_state.available_tools = []
-                        st.success("Logged out!")
-                        st.rerun()
-                    
-                    asyncio.run(logout())
+                if st.form_submit_button("Cancel"):
+                    st.session_state.show_add_server = False
+                    st.rerun()
     
-    # Connection Status
+    # Display current servers (simplified)
+    servers = st.session_state.mcp_manager.get_all_servers()
+    
+    if servers:
+        st.write("**Connected Servers:**")
+        for server in servers:
+            if server.connected:
+                col1, col2 = st.columns([3, 1])
+                with col1:
+                    st.write(f"🟢 **{server.name}** ({server.url}) - {server.tool_count} tools")
+                with col2:
+                    if st.button("🗑️ Remove", key=f"remove_{server.id}"):
+                        async def remove_server():
+                            try:
+                                await st.session_state.mcp_manager.remove_server(server.id)
+                                st.success(f"Removed {server.name}")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Failed to remove: {str(e)}")
+                        asyncio.run(remove_server())
+    
+    # Overall MCP Status
     st.divider()
-    st.subheader("Status")
-    if st.session_state.session_token:
-        st.success("🟢 Connected & Authenticated")
-        if st.session_state.available_tools:
-            st.info(f"🔧 {len(st.session_state.available_tools)} tools available")
+    st.subheader("MCP Status")
+    connected_servers = st.session_state.mcp_manager.get_connected_servers()
+    total_tools = sum(server.tool_count for server in connected_servers)
+    
+    if connected_servers:
+        st.success(f"🟢 {len(connected_servers)} server(s) connected")
+        if total_tools > 0:
+            st.info(f"🔧 {total_tools} tools available across all servers")
     else:
-        st.warning("🔴 Not authenticated")
+        st.warning("🔴 No MCP servers connected")
     
     # LLM Configuration
     st.divider()
@@ -223,13 +259,29 @@ with st.sidebar:
     else:
         st.warning("🤖 No LLM connected")
     
-    # Available Tools
-    if st.session_state.available_tools:
-        st.divider()
-        st.subheader("Available Tools")
-        with st.expander("MCP Tools", expanded=False):
-            for tool in st.session_state.available_tools:
-                st.text(f"• {tool.get('name', 'Unknown')}")
+    # Available Tools from all servers
+    async def get_all_tools_async():
+        return await st.session_state.mcp_manager.get_all_tools()
+    
+    try:
+        all_tools = asyncio.run(get_all_tools_async())
+        if all_tools:
+            st.divider()
+            st.subheader("Available Tools")
+            with st.expander(f"All MCP Tools ({len(all_tools)})", expanded=False):
+                # Group tools by server
+                from collections import defaultdict
+                tools_by_server = defaultdict(list)
+                for tool in all_tools:
+                    server_name = tool.get('server_name', 'Unknown Server')
+                    tools_by_server[server_name].append(tool)
+                
+                for server_name, tools in tools_by_server.items():
+                    st.write(f"**{server_name}** ({len(tools)} tools):")
+                    for tool in tools:
+                        st.text(f"  • {tool.get('original_name', 'Unknown')} → {tool.get('full_name', 'Unknown')}")
+    except:
+        pass  # Ignore errors in tool display
 
 # Main content area
 if st.session_state.current_page == "Chat":
@@ -327,11 +379,15 @@ if st.session_state.current_page == "Chat":
         
         async def process_with_llm():
             try:
-                # Generate response using LLM with optional MCP tools
+                # Get tools from multi-server manager
+                tools = await st.session_state.mcp_manager.get_all_tools()
+                
+                # Generate response using LLM with MCP tools from all servers
                 response_text, tool_calls = await st.session_state.llm_connector.generate_response(
                     messages=st.session_state.chat_messages,
-                    tools=st.session_state.available_tools if st.session_state.mcp_client else None,
-                    mcp_client=st.session_state.mcp_client,
+                    tools=tools,
+                    mcp_client=None,  # Legacy support
+                    mcp_manager=st.session_state.mcp_manager,  # Multi-server support
                     step_callback=step_callback
                 )
                 
@@ -365,10 +421,13 @@ if st.session_state.current_page == "Chat":
     # Help text based on connection status
     if not st.session_state.llm_connector:
         st.info("🤖 Please configure and connect an LLM provider to start chatting")
-    elif not st.session_state.mcp_client:
-        st.warning("🔐 No MCP server connected - you can chat with the LLM, but network management tools are not available")
     else:
-        st.success("✅ Ready for AI-powered network management!")
+        connected_servers = st.session_state.mcp_manager.get_connected_servers()
+        if not connected_servers:
+            st.warning("🔐 No MCP servers connected - you can chat with the LLM, but network management tools are not available")
+        else:
+            total_tools = sum(server.tool_count for server in connected_servers)
+            st.success(f"✅ Ready for AI-powered network management! ({len(connected_servers)} server(s), {total_tools} tools)")
     
     # Clear chat button
     if st.session_state.chat_messages:
@@ -564,22 +623,3 @@ elif st.session_state.current_page == "MCP Inspector":
         else:
             st.info("No test results yet. Configure your server and run tests to see results.")
 
-# Footer
-st.divider()
-st.markdown("### MCP Chat Interface")
-st.markdown("""
-**Current Features:**
-- 💬 AI-powered chat with optional network infrastructure context
-- 🤖 Multiple LLM providers: Anthropic Claude, OpenAI GPT, Ollama (local)
-- 🔧 Step-by-step tool calling visualization with real-time updates
-- 🔐 Optional MCP server configuration and authentication
-- 🔍 MCP Inspector for protocol testing
-- 📋 Real-time processing steps display
-- 📨 Immediate user message display
-
-**Coming Next:**
-- 🎯 Enhanced context management and conversation memory
-- 📊 Advanced network analysis workflows
-- 🔄 Multi-step workflow automation
-- 🌐 Additional LLM providers and local model support
-""")

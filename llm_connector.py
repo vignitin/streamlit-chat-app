@@ -9,7 +9,7 @@ from typing import Dict, Any, List, Optional, Tuple
 from datetime import datetime
 import anthropic
 import httpx
-from mcp_client import MCPClient
+from mcp_client import MCPClient, MCPServerManager
 
 # System messages for LLM configuration
 SYSTEM_MESSAGE_WITH_MCP = """You are an AI assistant with access to network infrastructure management tools through MCP (Model Context Protocol). 
@@ -30,14 +30,20 @@ class LLMConnector:
     def __init__(self, api_key: str):
         self.api_key = api_key
     
-    async def generate_response(self, messages: List[Dict], tools: List[Dict], mcp_client: MCPClient) -> Tuple[str, List[Dict]]:
+    async def generate_response(self, messages: List[Dict], tools: List[Dict] = None, mcp_client: MCPClient = None, mcp_manager: Any = None) -> Tuple[str, List[Dict]]:
         """Generate response from LLM with tool calling support"""
         raise NotImplementedError
     
-    async def _call_mcp_tool(self, tool_name: str, arguments: Dict, mcp_client: MCPClient) -> Dict:
+    async def _call_mcp_tool(self, tool_name: str, arguments: Dict, mcp_client: MCPClient = None, mcp_manager: Any = None) -> Dict:
         """Call MCP tool and return response"""
         try:
-            response = await mcp_client.call_tool(tool_name, arguments)
+            # Use manager if available (for multi-server support)
+            if mcp_manager:
+                response = await mcp_manager.call_tool(tool_name, arguments)
+            elif mcp_client:
+                response = await mcp_client.call_tool(tool_name, arguments)
+            else:
+                raise ValueError("No MCP client or manager available")
             
             # Extract text content from MCP response format
             if isinstance(response, dict) and 'content' in response:
@@ -81,10 +87,12 @@ class OpenAIConnector(LLMConnector):
         
         for tool in mcp_tools:
             # Convert MCP tool schema to OpenAI function format
+            # Use full_name for multi-server support, fall back to name for legacy compatibility
+            tool_name = tool.get("full_name", tool.get("name", ""))
             openai_tool = {
                 "type": "function",
                 "function": {
-                    "name": tool.get("name", ""),
+                    "name": tool_name,
                     "description": tool.get("description", ""),
                     "parameters": tool.get("inputSchema", {
                         "type": "object",
@@ -147,7 +155,7 @@ class OpenAIConnector(LLMConnector):
         
         return openai_messages
     
-    async def generate_response(self, messages: List[Dict], tools: List[Dict] = None, mcp_client: MCPClient = None, step_callback=None) -> Tuple[str, List[Dict]]:
+    async def generate_response(self, messages: List[Dict], tools: List[Dict] = None, mcp_client: MCPClient = None, mcp_manager: Any = None, step_callback=None) -> Tuple[str, List[Dict]]:
         """Generate response from OpenAI GPT with optional MCP tool support"""
         
         # Convert tools and messages to OpenAI format
@@ -155,7 +163,8 @@ class OpenAIConnector(LLMConnector):
         openai_messages = self._convert_messages_to_openai(messages)
         
         # System message
-        system_message = SYSTEM_MESSAGE_WITHOUT_MCP if not mcp_client else SYSTEM_MESSAGE_WITH_MCP
+        has_mcp = bool(mcp_client or mcp_manager)
+        system_message = SYSTEM_MESSAGE_WITHOUT_MCP if not has_mcp else SYSTEM_MESSAGE_WITH_MCP
         
         # Insert system message at beginning
         openai_messages.insert(0, {"role": "system", "content": system_message})
@@ -206,9 +215,9 @@ class OpenAIConnector(LLMConnector):
                             "arguments": arguments
                         })
                     
-                    # Execute MCP tool (only if client is available)
-                    if mcp_client:
-                        tool_result = await self._call_mcp_tool(tool_name, arguments, mcp_client)
+                    # Execute MCP tool (only if client or manager is available)
+                    if mcp_client or mcp_manager:
+                        tool_result = await self._call_mcp_tool(tool_name, arguments, mcp_client, mcp_manager)
                     else:
                         tool_result = {
                             "type": "text",
@@ -292,10 +301,12 @@ class OllamaConnector(LLMConnector):
         ollama_tools = []
         
         for tool in mcp_tools:
+            # Use full_name for multi-server support, fall back to name for legacy compatibility
+            tool_name = tool.get("full_name", tool.get("name", ""))
             ollama_tool = {
                 "type": "function",
                 "function": {
-                    "name": tool.get("name", ""),
+                    "name": tool_name,
                     "description": tool.get("description", ""),
                     "parameters": tool.get("inputSchema", {
                         "type": "object",
@@ -308,7 +319,7 @@ class OllamaConnector(LLMConnector):
         
         return ollama_tools
     
-    async def generate_response(self, messages: List[Dict], tools: List[Dict] = None, mcp_client: MCPClient = None, step_callback=None) -> Tuple[str, List[Dict]]:
+    async def generate_response(self, messages: List[Dict], tools: List[Dict] = None, mcp_client: MCPClient = None, mcp_manager: Any = None, step_callback=None) -> Tuple[str, List[Dict]]:
         """Generate response from Ollama with optional MCP tool support"""
         
         # Convert messages to simple format for Ollama
@@ -324,7 +335,8 @@ class OllamaConnector(LLMConnector):
             })
         
         # System message
-        if not mcp_client:
+        has_mcp = bool(mcp_client or mcp_manager)
+        if not has_mcp:
             system_message = "You are an AI assistant. You can have conversations and answer questions, but you don't currently have access to external tools or network infrastructure management capabilities."
         else:
             system_message = """You are an AI assistant with access to network infrastructure management tools. When a user requests network operations, explain what you would do and ask them to confirm, since tool integration with Ollama is experimental."""
@@ -387,8 +399,10 @@ class AnthropicConnector(LLMConnector):
         
         for tool in mcp_tools:
             # Convert MCP tool schema to Anthropic format
+            # Use full_name for multi-server support, fall back to name for legacy compatibility
+            tool_name = tool.get("full_name", tool.get("name", ""))
             anthropic_tool = {
-                "name": tool.get("name", ""),
+                "name": tool_name,
                 "description": tool.get("description", ""),
                 "input_schema": tool.get("inputSchema", {
                     "type": "object",
@@ -463,7 +477,7 @@ class AnthropicConnector(LLMConnector):
         
         return anthropic_messages
     
-    async def generate_response(self, messages: List[Dict], tools: List[Dict] = None, mcp_client: MCPClient = None, step_callback=None) -> Tuple[str, List[Dict]]:
+    async def generate_response(self, messages: List[Dict], tools: List[Dict] = None, mcp_client: MCPClient = None, mcp_manager: Any = None, step_callback=None) -> Tuple[str, List[Dict]]:
         """Generate response from Anthropic Claude with optional MCP tool support
         
         Args:
@@ -478,7 +492,8 @@ class AnthropicConnector(LLMConnector):
         anthropic_messages = self._convert_messages_to_anthropic(messages)
         
         # System message based on MCP availability
-        system_message = SYSTEM_MESSAGE_WITHOUT_MCP if not mcp_client else SYSTEM_MESSAGE_WITH_MCP
+        has_mcp = bool(mcp_client or mcp_manager)
+        system_message = SYSTEM_MESSAGE_WITHOUT_MCP if not has_mcp else SYSTEM_MESSAGE_WITH_MCP
         
         
         try:
@@ -509,15 +524,16 @@ class AnthropicConnector(LLMConnector):
                                 "arguments": content_block.input
                             })
                         
-                        # Execute MCP tool (only if client is available)
-                        if mcp_client:
+                        # Execute MCP tool (if client or manager is available)
+                        if mcp_client or mcp_manager:
                             tool_result = await self._call_mcp_tool(
                                 content_block.name,
                                 content_block.input,
-                                mcp_client
+                                mcp_client,
+                                mcp_manager
                             )
                         else:
-                            # No MCP client available
+                            # No MCP client or manager available
                             tool_result = {
                                 "type": "text",
                                 "text": "Tool execution not available - no MCP server connected"
@@ -605,15 +621,16 @@ class AnthropicConnector(LLMConnector):
                                         "arguments": content_block.input
                                     })
                                 
-                                # Execute additional MCP tool (only if client is available)
-                                if mcp_client:
+                                # Execute additional MCP tool (if client or manager is available)
+                                if mcp_client or mcp_manager:
                                     tool_result = await self._call_mcp_tool(
                                         content_block.name,
                                         content_block.input,
-                                        mcp_client
+                                        mcp_client,
+                                        mcp_manager
                                     )
                                 else:
-                                    # No MCP client available
+                                    # No MCP client or manager available
                                     tool_result = {
                                         "type": "text",
                                         "text": "Tool execution not available - no MCP server connected"
