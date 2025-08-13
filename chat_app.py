@@ -3,7 +3,8 @@ import json
 import asyncio
 from typing import Dict, Any, Optional, List
 from datetime import datetime
-from mcp_client import MCPClient, create_mcp_client
+from mcp_client import MCPClient, create_mcp_client, extract_mcp_response_text
+from llm_connector import create_llm_connector
 
 st.set_page_config(
     page_title="MCP Chat Interface",
@@ -22,6 +23,12 @@ if 'available_tools' not in st.session_state:
     st.session_state.available_tools = []
 if 'current_page' not in st.session_state:
     st.session_state.current_page = "Chat"
+if 'llm_connector' not in st.session_state:
+    st.session_state.llm_connector = None
+if 'processing_steps' not in st.session_state:
+    st.session_state.processing_steps = []
+if 'current_user_input' not in st.session_state:
+    st.session_state.current_user_input = None
 
 # Sidebar for configuration and navigation
 with st.sidebar:
@@ -104,8 +111,121 @@ with st.sidebar:
     else:
         st.warning("🔴 Not authenticated")
     
+    # LLM Configuration
+    st.divider()
+    st.subheader("LLM Configuration")
+    
+    llm_provider = st.selectbox(
+        "LLM Provider",
+        ["None", "Anthropic", "OpenAI", "Ollama"],
+        help="Select your preferred LLM provider"
+    )
+    
+    if llm_provider == "Anthropic":
+        with st.expander("Anthropic Settings", expanded=True):
+            anthropic_api_key = st.text_input(
+                "Anthropic API Key", 
+                type="password",
+                help="Your Anthropic API key"
+            )
+            anthropic_model = st.selectbox(
+                "Model",
+                ["claude-3-5-sonnet-20241022", "claude-3-haiku-20240307", "claude-3-opus-20240229"],
+                help="Select Claude model"
+            )
+            
+            if st.button("🤖 Connect Anthropic") and anthropic_api_key:
+                try:
+                    llm_connector = create_llm_connector(
+                        provider="anthropic",
+                        api_key=anthropic_api_key,
+                        model=anthropic_model
+                    )
+                    st.session_state.llm_connector = llm_connector
+                    st.success("✅ Anthropic connected!")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"❌ Anthropic connection failed: {str(e)}")
+    
+    elif llm_provider == "OpenAI":
+        with st.expander("OpenAI Settings", expanded=True):
+            openai_api_key = st.text_input(
+                "OpenAI API Key", 
+                type="password",
+                help="Your OpenAI API key"
+            )
+            openai_model = st.selectbox(
+                "Model",
+                ["gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "gpt-3.5-turbo"],
+                help="Select OpenAI model"
+            )
+            
+            openai_base_url = st.text_input(
+                "Base URL (Advanced)",
+                value="https://api.openai.com/v1",
+                help="OpenAI API base URL - change for Azure OpenAI or compatible endpoints"
+            )
+            
+            if st.button("🤖 Connect OpenAI") and openai_api_key:
+                try:
+                    llm_connector = create_llm_connector(
+                        provider="openai",
+                        api_key=openai_api_key,
+                        model=openai_model,
+                        base_url=openai_base_url
+                    )
+                    st.session_state.llm_connector = llm_connector
+                    st.success("✅ OpenAI connected!")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"❌ OpenAI connection failed: {str(e)}")
+    
+    elif llm_provider == "Ollama":
+        with st.expander("Ollama Settings", expanded=True):
+            st.info("🏠 Ollama runs locally - no API key required")
+            
+            ollama_model = st.text_input(
+                "Model",
+                value="llama3.1:8b",
+                help="Ollama model name (e.g., llama3.1:8b, codellama:7b, mistral:7b)"
+            )
+            
+            # Default to host.docker.internal when likely running in Docker
+            import os
+            default_ollama_url = "http://host.docker.internal:11434" if os.path.exists("/.dockerenv") else "http://localhost:11434"
+            
+            ollama_base_url = st.text_input(
+                "Base URL (Advanced)",
+                value=default_ollama_url,
+                help="Ollama server URL - defaults to host.docker.internal:11434 in Docker, localhost:11434 otherwise"
+            )
+            
+            if st.button("🤖 Connect Ollama"):
+                try:
+                    llm_connector = create_llm_connector(
+                        provider="ollama",
+                        api_key="ollama",  # Not used for Ollama
+                        model=ollama_model,
+                        base_url=ollama_base_url
+                    )
+                    st.session_state.llm_connector = llm_connector
+                    st.success("✅ Ollama connected!")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"❌ Ollama connection failed: {str(e)}")
+    
+    # LLM Status
+    if st.session_state.llm_connector:
+        # Try to determine LLM provider from connector type
+        connector_type = type(st.session_state.llm_connector).__name__
+        provider_name = connector_type.replace("Connector", "") if "Connector" in connector_type else "LLM"
+        st.success(f"🤖 {provider_name} Connected")
+    else:
+        st.warning("🤖 No LLM connected")
+    
     # Available Tools
     if st.session_state.available_tools:
+        st.divider()
         st.subheader("Available Tools")
         with st.expander("MCP Tools", expanded=False):
             for tool in st.session_state.available_tools:
@@ -127,7 +247,18 @@ if st.session_state.current_page == "Chat":
                 # Show timestamp for each message
                 st.caption(f"🕐 {message['timestamp']}")
                 
-                # Show tool calls if any
+                # Show processing steps if any (step-by-step tool calling)
+                if "processing_steps" in message and message["processing_steps"]:
+                    with st.expander("🔍 Processing Steps", expanded=False):
+                        for step in message["processing_steps"]:
+                            if step["type"] == "tool_start":
+                                st.info(f"⚡ {step['timestamp']} - {step['message']}")
+                            elif step["type"] == "tool_complete":
+                                st.success(f"✅ {step['timestamp']} - {step['message']}")
+                            elif step["type"] == "reasoning":
+                                st.write(f"💭 {step['timestamp']} - {step['message']}")
+                
+                # Show tool calls if any (legacy format)
                 if "tool_calls" in message and message["tool_calls"]:
                     with st.expander("🔧 Tool Calls", expanded=False):
                         for tool_call in message["tool_calls"]:
@@ -136,32 +267,108 @@ if st.session_state.current_page == "Chat":
     # Chat input
     st.divider()
     
-    # Message input
+    # Message input (allow LLM-only mode)
+    input_disabled = not st.session_state.llm_connector
+    help_text = "Connect an LLM provider first" if input_disabled else "Type your message here..."
+    
     user_input = st.chat_input(
-        "Type your message here...",
-        disabled=not st.session_state.mcp_client,
+        help_text,
+        disabled=input_disabled,
         key="chat_input"
     )
     
-    if user_input and st.session_state.mcp_client:
-        # Add user message to chat
+    if user_input and st.session_state.llm_connector:
+        # Add user message to chat immediately
         user_message = {
             "role": "user",
             "content": user_input,
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         }
         st.session_state.chat_messages.append(user_message)
+        st.session_state.current_user_input = user_input
+        st.session_state.processing_steps = []
         
-        # TODO: Process message with LLM and MCP tools
-        # For now, just echo back
-        assistant_message = {
-            "role": "assistant", 
-            "content": f"Echo: {user_input}\n\n*Note: LLM integration coming in Step 3*",
-            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        }
-        st.session_state.chat_messages.append(assistant_message)
-        
+        # Force rerun to show user message immediately
         st.rerun()
+        
+    # Process LLM request if we have user input that hasn't been processed yet
+    if (st.session_state.current_user_input and 
+        st.session_state.llm_connector and 
+        len(st.session_state.chat_messages) > 0 and 
+        st.session_state.chat_messages[-1]["role"] == "user" and 
+        st.session_state.chat_messages[-1]["content"] == st.session_state.current_user_input):
+        
+        # Create containers for step-by-step display
+        processing_container = st.container()
+        
+        with processing_container:
+            st.write("🤖 **Processing your request...**")
+            steps_placeholder = st.empty()
+        
+        # Define step callback for real-time updates
+        async def step_callback(message: str, step_type: str, data: dict):
+            step_info = {
+                "message": message,
+                "type": step_type,
+                "timestamp": datetime.now().strftime("%H:%M:%S"),
+                "data": data
+            }
+            st.session_state.processing_steps.append(step_info)
+            
+            # Update the display with current steps
+            with steps_placeholder.container():
+                for step in st.session_state.processing_steps:
+                    if step["type"] == "tool_start":
+                        st.info(f"⚡ {step['timestamp']} - {step['message']}")
+                    elif step["type"] == "tool_complete":
+                        st.success(f"✅ {step['timestamp']} - {step['message']}")
+                    elif step["type"] == "reasoning":
+                        st.write(f"💭 {step['timestamp']} - {step['message']}")
+        
+        async def process_with_llm():
+            try:
+                # Generate response using LLM with optional MCP tools
+                response_text, tool_calls = await st.session_state.llm_connector.generate_response(
+                    messages=st.session_state.chat_messages,
+                    tools=st.session_state.available_tools if st.session_state.mcp_client else None,
+                    mcp_client=st.session_state.mcp_client,
+                    step_callback=step_callback
+                )
+                
+                # Create assistant message
+                assistant_message = {
+                    "role": "assistant",
+                    "content": response_text,
+                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "tool_calls": tool_calls if tool_calls else [],
+                    "processing_steps": st.session_state.processing_steps.copy()
+                }
+                
+                st.session_state.chat_messages.append(assistant_message)
+                st.session_state.current_user_input = None  # Clear processed input
+                st.session_state.processing_steps = []  # Clear steps
+                
+            except Exception as e:
+                error_message = {
+                    "role": "assistant",
+                    "content": f"❌ Error processing request: {str(e)}",
+                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                }
+                st.session_state.chat_messages.append(error_message)
+                st.session_state.current_user_input = None  # Clear processed input
+                st.session_state.processing_steps = []  # Clear steps
+        
+        # Run async LLM processing
+        asyncio.run(process_with_llm())
+        st.rerun()
+    
+    # Help text based on connection status
+    if not st.session_state.llm_connector:
+        st.info("🤖 Please configure and connect an LLM provider to start chatting")
+    elif not st.session_state.mcp_client:
+        st.warning("🔐 No MCP server connected - you can chat with the LLM, but network management tools are not available")
+    else:
+        st.success("✅ Ready for AI-powered network management!")
     
     # Clear chat button
     if st.session_state.chat_messages:
@@ -252,12 +459,7 @@ elif st.session_state.current_page == "MCP Inspector":
                             result = await client.call_tool(tool_name, tool_args)
                             
                             # Extract text content from MCP response format
-                            response_content = result
-                            if isinstance(result, dict) and 'content' in result:
-                                content_items = result.get('content', [])
-                                if content_items and isinstance(content_items, list):
-                                    text_contents = [item.get('text', '') for item in content_items if item.get('type') == 'text']
-                                    response_content = '\n'.join(text_contents) if text_contents else result
+                            response_content = extract_mcp_response_text(result)
                             
                             st.session_state.test_results.append({
                                 "endpoint": f"Call Tool: {tool_name}",
@@ -367,13 +569,17 @@ st.divider()
 st.markdown("### MCP Chat Interface")
 st.markdown("""
 **Current Features:**
-- 💬 Chat interface with message history
-- 🔧 MCP server configuration in sidebar  
-- 🔐 Authentication support
+- 💬 AI-powered chat with optional network infrastructure context
+- 🤖 Multiple LLM providers: Anthropic Claude, OpenAI GPT, Ollama (local)
+- 🔧 Step-by-step tool calling visualization with real-time updates
+- 🔐 Optional MCP server configuration and authentication
 - 🔍 MCP Inspector for protocol testing
+- 📋 Real-time processing steps display
+- 📨 Immediate user message display
 
 **Coming Next:**
-- 🤖 LLM integration (OpenAI, Anthropic, Ollama)
-- 🔄 Automatic MCP tool calling
-- 🎯 Context-aware responses
+- 🎯 Enhanced context management and conversation memory
+- 📊 Advanced network analysis workflows
+- 🔄 Multi-step workflow automation
+- 🌐 Additional LLM providers and local model support
 """)

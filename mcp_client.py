@@ -8,6 +8,25 @@ import json
 from typing import Dict, Any, Optional, List
 from dataclasses import dataclass
 import asyncio
+
+
+def extract_mcp_response_text(response: Dict[str, Any]) -> str:
+    """Extract text content from MCP response format
+    
+    Args:
+        response: MCP response dictionary
+        
+    Returns:
+        Extracted text content as string
+    """
+    if isinstance(response, dict) and 'content' in response:
+        content_items = response.get('content', [])
+        if content_items and isinstance(content_items, list):
+            text_contents = [item.get('text', '') for item in content_items if item.get('type') == 'text']
+            return '\n'.join(text_contents) if text_contents else str(response)
+    return str(response)
+
+
 from datetime import datetime
 
 @dataclass
