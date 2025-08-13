@@ -1,0 +1,14 @@
+version: '3.8'
+
+services:
+  streamlit-chat:
+    build: .
+    container_name: streamlit-chat-app
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./:/app
+      - /app/__pycache__
+    environment:
+      - PYTHONUNBUFFERED=1
+    restart: unless-stopped
