@@ -1,9 +1,9 @@
 import streamlit as st
 import json
-import httpx
-from typing import Dict, Any, Optional
 import asyncio
+from typing import Dict, Any, Optional
 from datetime import datetime
+from mcp_client import MCPClient, create_mcp_client
 
 st.set_page_config(
     page_title="MCP Inspector - RBAC Testing",
@@ -16,6 +16,10 @@ st.title("🔍 MCP Inspector - RBAC Authentication Testing")
 # Initialize session state
 if 'test_results' not in st.session_state:
     st.session_state.test_results = []
+if 'mcp_client' not in st.session_state:
+    st.session_state.mcp_client = None
+if 'session_token' not in st.session_state:
+    st.session_state.session_token = None
 
 # Sidebar for configuration
 with st.sidebar:
@@ -23,30 +27,63 @@ with st.sidebar:
     
     server_url = st.text_input(
         "MCP Server URL",
-        value="http://localhost:8000",
-        help="Base URL of your MCP server"
+        value="http://localhost:8080",
+        help="Base URL of your MCP server (running apstra_mcp.py)"
     )
     
     st.subheader("Authentication")
     auth_method = st.selectbox(
         "Authentication Method",
-        ["None", "Bearer Token", "Basic Auth"]
+        ["Session-based (MCP)", "None"]
     )
     
-    auth_token = None
-    username = None
-    password = None
-    
-    if auth_method == "Bearer Token":
-        auth_token = st.text_input("Bearer Token", type="password")
-    elif auth_method == "Basic Auth":
-        username = st.text_input("Username")
-        password = st.text_input("Password", type="password")
+    # MCP Session-based auth
+    if auth_method == "Session-based (MCP)":
+        username = st.text_input("Apstra Username")
+        password = st.text_input("Apstra Password", type="password")
+        apstra_server = st.text_input("Apstra Server", value="apstra.company.com")
+        apstra_port = st.text_input("Apstra Port", value="443")
+        
+        # Login/Logout controls
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("🔐 Login", disabled=not (username and password and apstra_server)):
+                async def login():
+                    try:
+                        client = create_mcp_client(server_url)
+                        session_token = await client.login(username, password, apstra_server, apstra_port)
+                        st.session_state.mcp_client = client
+                        st.session_state.session_token = session_token
+                        st.success("✅ Login successful!")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"❌ Login failed: {str(e)}")
+                
+                asyncio.run(login())
+        
+        with col2:
+            if st.button("🔓 Logout", disabled=not st.session_state.session_token):
+                async def logout():
+                    if st.session_state.mcp_client:
+                        await st.session_state.mcp_client.logout()
+                    st.session_state.mcp_client = None
+                    st.session_state.session_token = None
+                    st.success("Logged out successfully!")
+                    st.rerun()
+                
+                asyncio.run(logout())
+        
+        # Show login status
+        if st.session_state.session_token:
+            st.success(f"🟢 Logged in as: {username}")
+        else:
+            st.warning("🔴 Not logged in")
     
     st.divider()
     
     # Test endpoints
     st.subheader("Test Endpoints")
+    test_connection = st.checkbox("Test Connection", value=True)
     test_list_tools = st.checkbox("List Tools", value=True)
     test_call_tool = st.checkbox("Call Tool", value=True)
     test_list_prompts = st.checkbox("List Prompts", value=True)
@@ -59,38 +96,51 @@ with col1:
     st.header("Test Controls")
     
     if test_call_tool:
-        tool_name = st.text_input("Tool Name", value="", help="Name of the tool to call")
+        tool_name = st.text_input("Tool Name", value="get_bp", help="Name of the tool to call")
         tool_args_str = st.text_area(
             "Tool Arguments (JSON)", 
-            value='{}',
+            value='{"blueprint_id": ""}',
             help="Arguments to pass to the tool in JSON format"
         )
     
     if st.button("🚀 Run Tests", type="primary"):
-        # Prepare headers
-        headers = {"Content-Type": "application/json"}
-        
-        if auth_method == "Bearer Token" and auth_token:
-            headers["Authorization"] = f"Bearer {auth_token}"
-        
         # Clear previous results
         st.session_state.test_results = []
         
         async def run_tests():
-            async with httpx.AsyncClient() as client:
+            try:
+                # Create or use existing MCP client
+                if st.session_state.mcp_client:
+                    client = st.session_state.mcp_client
+                else:
+                    client = create_mcp_client(server_url)
+                
+                # Test connection
+                if test_connection:
+                    try:
+                        result = await client.test_connection()
+                        st.session_state.test_results.append({
+                            "endpoint": "Test Connection",
+                            "status": "Success" if result["status"] == "success" else "Error",
+                            "response": result,
+                            "timestamp": datetime.now().isoformat()
+                        })
+                    except Exception as e:
+                        st.session_state.test_results.append({
+                            "endpoint": "Test Connection",
+                            "status": "Error",
+                            "response": str(e),
+                            "timestamp": datetime.now().isoformat()
+                        })
+                
                 # Test list tools
                 if test_list_tools:
                     try:
-                        response = await client.post(
-                            f"{server_url}/mcp/v1/list_tools",
-                            headers=headers,
-                            auth=(username, password) if auth_method == "Basic Auth" else None,
-                            json={}
-                        )
+                        tools = await client.list_tools()
                         st.session_state.test_results.append({
                             "endpoint": "List Tools",
-                            "status": response.status_code,
-                            "response": response.json() if response.status_code == 200 else response.text,
+                            "status": "Success",
+                            "response": {"tools": tools, "count": len(tools)},
                             "timestamp": datetime.now().isoformat()
                         })
                     except Exception as e:
@@ -105,21 +155,11 @@ with col1:
                 if test_call_tool and tool_name:
                     try:
                         tool_args = json.loads(tool_args_str)
-                        response = await client.post(
-                            f"{server_url}/mcp/v1/call_tool",
-                            headers=headers,
-                            auth=(username, password) if auth_method == "Basic Auth" else None,
-                            json={
-                                "params": {
-                                    "name": tool_name,
-                                    "arguments": tool_args
-                                }
-                            }
-                        )
+                        result = await client.call_tool(tool_name, tool_args)
                         st.session_state.test_results.append({
                             "endpoint": f"Call Tool: {tool_name}",
-                            "status": response.status_code,
-                            "response": response.json() if response.status_code == 200 else response.text,
+                            "status": "Success",
+                            "response": result,
                             "timestamp": datetime.now().isoformat()
                         })
                     except Exception as e:
@@ -133,16 +173,11 @@ with col1:
                 # Test list prompts
                 if test_list_prompts:
                     try:
-                        response = await client.post(
-                            f"{server_url}/mcp/v1/list_prompts",
-                            headers=headers,
-                            auth=(username, password) if auth_method == "Basic Auth" else None,
-                            json={}
-                        )
+                        prompts = await client.list_prompts()
                         st.session_state.test_results.append({
                             "endpoint": "List Prompts",
-                            "status": response.status_code,
-                            "response": response.json() if response.status_code == 200 else response.text,
+                            "status": "Success",
+                            "response": {"prompts": prompts, "count": len(prompts)},
                             "timestamp": datetime.now().isoformat()
                         })
                     except Exception as e:
@@ -156,16 +191,11 @@ with col1:
                 # Test list resources
                 if test_list_resources:
                     try:
-                        response = await client.post(
-                            f"{server_url}/mcp/v1/list_resources",
-                            headers=headers,
-                            auth=(username, password) if auth_method == "Basic Auth" else None,
-                            json={}
-                        )
+                        resources = await client.list_resources()
                         st.session_state.test_results.append({
                             "endpoint": "List Resources",
-                            "status": response.status_code,
-                            "response": response.json() if response.status_code == 200 else response.text,
+                            "status": "Success",
+                            "response": {"resources": resources, "count": len(resources)},
                             "timestamp": datetime.now().isoformat()
                         })
                     except Exception as e:
@@ -175,6 +205,14 @@ with col1:
                             "response": str(e),
                             "timestamp": datetime.now().isoformat()
                         })
+            
+            except Exception as e:
+                st.session_state.test_results.append({
+                    "endpoint": "General Error",
+                    "status": "Error", 
+                    "response": f"Test execution failed: {str(e)}",
+                    "timestamp": datetime.now().isoformat()
+                })
         
         # Run async tests
         asyncio.run(run_tests())
@@ -188,17 +226,12 @@ with col2:
             with st.expander(f"{result['endpoint']} - Status: {result['status']}", expanded=True):
                 st.text(f"Timestamp: {result['timestamp']}")
                 
-                if isinstance(result['status'], int):
-                    if result['status'] == 200:
-                        st.success(f"Status: {result['status']} ✅")
-                    elif result['status'] == 401:
-                        st.error(f"Status: {result['status']} - Unauthorized ❌")
-                    elif result['status'] == 403:
-                        st.error(f"Status: {result['status']} - Forbidden ❌")
-                    else:
-                        st.warning(f"Status: {result['status']} ⚠️")
-                else:
+                if result['status'] == "Success":
+                    st.success(f"Status: {result['status']} ✅")
+                elif result['status'] == "Error":
                     st.error(f"Status: {result['status']} ❌")
+                else:
+                    st.warning(f"Status: {result['status']} ⚠️")
                 
                 st.subheader("Response:")
                 if isinstance(result['response'], dict):
@@ -212,17 +245,24 @@ with col2:
 st.divider()
 st.markdown("### How to Use")
 st.markdown("""
-1. Configure your MCP server URL in the sidebar
-2. Set up authentication (Bearer token or Basic auth)
-3. Select which endpoints to test
-4. Click 'Run Tests' to execute the tests
-5. Review the results to ensure RBAC is working correctly
+1. **Start the MCP Server**: Run `python apstra_mcp.py -t http -H 0.0.0.0 -p 8080` 
+2. **Configure Server URL**: Set the MCP server URL (default: http://localhost:8080)
+3. **Login**: Use session-based authentication with your Apstra credentials
+4. **Test**: Select endpoints to test and click 'Run Tests'
+5. **Review**: Check results to ensure proper MCP protocol and RBAC behavior
 """)
 
 st.markdown("### Expected RBAC Behavior")
 st.markdown("""
-- **Without authentication**: Should return 401 Unauthorized
-- **With invalid token**: Should return 401 Unauthorized
-- **With valid token but insufficient permissions**: Should return 403 Forbidden
-- **With valid token and proper permissions**: Should return 200 OK with data
+- **Without login**: Tools should fail with authentication error
+- **With invalid credentials**: Login should fail
+- **With valid login**: All tools should work with user's identity
+- **Session timeout**: Tools should fail after session expires
+
+### MCP Protocol Endpoints Tested:
+- **Test Connection**: Validates server availability and protocol
+- **List Tools**: Discovers available Apstra tools
+- **Call Tool**: Executes specific tools with arguments
+- **List Prompts**: Gets available prompts (if supported)
+- **List Resources**: Gets available resources (if supported)
 """)
