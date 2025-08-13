@@ -32,7 +32,7 @@ class MCPClient:
         
     async def initialize(self) -> Dict[str, Any]:
         """Initialize connection with MCP server"""
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=60.0) as client:
             response = await client.post(
                 f"{self.server_url}/mcp/v1/initialize",
                 json={},
@@ -46,17 +46,17 @@ class MCPClient:
             else:
                 raise Exception(f"Failed to initialize: {response.status_code} - {response.text}")
     
-    async def login(self, username: str, password: str, apstra_server: str, apstra_port: str = "443") -> str:
+    async def login(self, username: str, password: str, auth_server: str, auth_port: str = "443") -> str:
         """Login to get session token (for session-based auth)"""
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=60.0) as client:
             # Call the login tool directly
             response = await client.post(
                 f"{self.server_url}/tools/login",
                 json={
-                    "apstra_username": username,
-                    "apstra_password": password,
-                    "apstra_server": apstra_server,
-                    "apstra_port": apstra_port
+                    "username": username,
+                    "password": password,
+                    "server": auth_server,
+                    "port": auth_port
                 }
             )
             
@@ -75,7 +75,7 @@ class MCPClient:
         if not self.session_token:
             return True
             
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=60.0) as client:
             response = await client.post(
                 f"{self.server_url}/tools/logout",
                 json={"session_token": self.session_token}
@@ -88,7 +88,7 @@ class MCPClient:
     
     async def list_tools(self) -> List[Dict[str, Any]]:
         """List available tools from MCP server"""
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=60.0) as client:
             response = await client.post(
                 f"{self.server_url}/mcp/v1/list_tools",
                 json={},
@@ -104,11 +104,8 @@ class MCPClient:
     
     async def call_tool(self, tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """Call a specific tool with arguments"""
-        # Add session token to arguments if we have one
-        if self.session_token:
-            arguments["session_token"] = self.session_token
-            
-        async with httpx.AsyncClient() as client:
+        # Authentication is handled via Authorization header, not arguments
+        async with httpx.AsyncClient(timeout=60.0) as client:
             response = await client.post(
                 f"{self.server_url}/mcp/v1/call_tool",
                 json={
@@ -121,13 +118,17 @@ class MCPClient:
             )
             
             if response.status_code == 200:
-                return response.json()
+                try:
+                    result = response.json()
+                    return result
+                except json.JSONDecodeError as e:
+                    raise Exception(f"Invalid JSON response: {e}")
             else:
                 raise Exception(f"Tool call failed: {response.status_code} - {response.text}")
     
     async def list_prompts(self) -> List[Dict[str, Any]]:
         """List available prompts from MCP server"""
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=60.0) as client:
             response = await client.post(
                 f"{self.server_url}/mcp/v1/list_prompts",
                 json={},
@@ -143,7 +144,7 @@ class MCPClient:
     
     async def list_resources(self) -> List[Dict[str, Any]]:
         """List available resources from MCP server"""
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=60.0) as client:
             response = await client.post(
                 f"{self.server_url}/mcp/v1/list_resources",
                 json={},
