@@ -14,13 +14,18 @@ from mcp_client import MCPClient, MCPServerManager
 # System messages for LLM configuration
 SYSTEM_MESSAGE_WITH_MCP = """You are an AI assistant with access to network infrastructure management tools through MCP (Model Context Protocol). 
 
-CRITICAL: When calling tools, the responses will include detailed formatting guidelines and context that MUST be preserved and used exactly as provided. These guidelines contain:
-- Status icons (✅❌⚠️🔄⏸️❓🔴🟡🟢🔵) 
-- Table formatting instructions
-- Network infrastructure presentation standards
-- Data organization rules
+When calling tools, some responses may include formatting guidelines or presentation instructions. If formatting guidelines are provided in a tool response:
+- Follow them exactly as specified
+- Use any status icons, table formats, or organization rules provided
+- Apply the guidelines consistently across your response
 
-Always follow the formatting guidelines provided by the tools to ensure consistent, professional network infrastructure reporting."""
+If no specific formatting guidelines are provided, present the information in a clear, well-organized manner using:
+- Tables for structured data
+- Appropriate status indicators (✅ ❌ ⚠️ etc.)
+- Logical grouping and sorting of information
+- Summary sections for complex data
+
+Always strive for clear, professional presentation of network infrastructure information."""
 
 SYSTEM_MESSAGE_WITHOUT_MCP = """You are an AI assistant. You can have conversations and answer questions, but you don't currently have access to external tools or network infrastructure management capabilities."""
 
@@ -29,6 +34,23 @@ class LLMConnector:
     
     def __init__(self, api_key: str):
         self.api_key = api_key
+        self.max_tool_rounds = 50  # High default limit
+        self.seen_calls = set()  # For loop detection
+    
+    def _is_loop_detected(self, tool_name: str, arguments: Dict) -> bool:
+        """Detect if the same tool call is being repeated (potential infinite loop)"""
+        # Create a unique signature for this tool call
+        call_signature = f"{tool_name}:{json.dumps(arguments, sort_keys=True)}"
+        
+        if call_signature in self.seen_calls:
+            return True  # Same exact call repeated - likely a loop
+        
+        self.seen_calls.add(call_signature)
+        return False
+    
+    def _reset_loop_detection(self):
+        """Reset loop detection for new conversation"""
+        self.seen_calls.clear()
     
     async def generate_response(self, messages: List[Dict], tools: List[Dict] = None, mcp_client: MCPClient = None, mcp_manager: Any = None) -> Tuple[str, List[Dict]]:
         """Generate response from LLM with tool calling support"""
@@ -158,6 +180,9 @@ class OpenAIConnector(LLMConnector):
     async def generate_response(self, messages: List[Dict], tools: List[Dict] = None, mcp_client: MCPClient = None, mcp_manager: Any = None, step_callback=None) -> Tuple[str, List[Dict]]:
         """Generate response from OpenAI GPT with optional MCP tool support"""
         
+        # Reset loop detection for new conversation
+        self._reset_loop_detection()
+        
         # Convert tools and messages to OpenAI format
         openai_tools = self._convert_mcp_tools_to_openai(tools) if tools else []
         openai_messages = self._convert_messages_to_openai(messages)
@@ -215,6 +240,11 @@ class OpenAIConnector(LLMConnector):
                             "arguments": arguments
                         })
                     
+                    # Check for infinite loops
+                    if self._is_loop_detected(tool_name, arguments):
+                        # Return a message about the loop detection
+                        return f"Loop detected: The same tool call '{tool_name}' with identical arguments was attempted multiple times. Stopping to prevent infinite loop.", tool_calls
+                    
                     # Execute MCP tool (only if client or manager is available)
                     if mcp_client or mcp_manager:
                         tool_result = await self._call_mcp_tool(tool_name, arguments, mcp_client, mcp_manager)
@@ -238,47 +268,108 @@ class OpenAIConnector(LLMConnector):
                         "result": tool_result
                     })
                 
-                # If there were tool calls, make follow-up request with results
+                # If there were tool calls, handle multiple rounds
                 if tool_calls:
-                    # Add assistant message with tool calls
-                    openai_messages.append({
-                        "role": "assistant",
-                        "content": response_text,
-                        "tool_calls": [{
-                            "id": tc["id"],
-                            "type": "function",
-                            "function": {
-                                "name": tc["name"],
-                                "arguments": json.dumps(tc["arguments"])
-                            }
-                        } for tc in tool_calls]
-                    })
+                    # Track all tool calls across rounds
+                    all_tool_calls = tool_calls.copy()
+                    current_round = 0
                     
-                    # Add tool results
-                    for tool_call in tool_calls:
+                    while current_round < self.max_tool_rounds:
+                        # Add assistant message with tool calls
                         openai_messages.append({
-                            "role": "tool",
-                            "tool_call_id": tool_call["id"],
-                            "content": tool_call["result"]["text"]
+                            "role": "assistant",
+                            "content": response_text if current_round == 0 else "",
+                            "tool_calls": [{
+                                "id": tc["id"],
+                                "type": "function",
+                                "function": {
+                                    "name": tc["name"],
+                                    "arguments": json.dumps(tc["arguments"])
+                                }
+                            } for tc in tool_calls]
                         })
+                        
+                        # Add tool results
+                        for tool_call in tool_calls:
+                            openai_messages.append({
+                                "role": "tool",
+                                "tool_call_id": tool_call["id"],
+                                "content": tool_call["result"]["text"]
+                            })
+                        
+                        # Get next response
+                        follow_up_payload = {
+                            "model": self.model,
+                            "messages": openai_messages,
+                            "tools": openai_tools if openai_tools else None,
+                            "max_tokens": 4096,
+                            "temperature": 0.7
+                        }
+                        
+                        follow_up_response = await self.client.post(
+                            f"{self.base_url}/chat/completions",
+                            json=follow_up_payload
+                        )
+                        follow_up_response.raise_for_status()
+                        follow_up_data = follow_up_response.json()
+                        
+                        follow_up_message = follow_up_data["choices"][0]["message"]
+                        follow_up_text = follow_up_message.get("content", "")
+                        
+                        # Check for more tool calls
+                        if follow_up_message.get("tool_calls"):
+                            tool_calls = []
+                            for tool_call in follow_up_message["tool_calls"]:
+                                function = tool_call["function"]
+                                tool_name = function["name"]
+                                
+                                # Extract server and actual tool name
+                                if "__" in tool_name:
+                                    server_name, actual_tool_name = tool_name.split("__", 1)
+                                else:
+                                    server_name = "default"
+                                    actual_tool_name = tool_name
+                                
+                                try:
+                                    arguments = json.loads(function["arguments"])
+                                except json.JSONDecodeError:
+                                    arguments = {}
+                                
+                                # Check for infinite loops
+                                if self._is_loop_detected(tool_name, arguments):
+                                    # Stop processing and return current state
+                                    return f"Loop detected: The same tool call '{tool_name}' with identical arguments was attempted multiple times. Stopping to prevent infinite loop.", all_tool_calls
+                                
+                                # Execute tool with multi-server support
+                                tool_result = await mcp_manager.call_tool(
+                                    server_name=server_name,
+                                    tool_name=actual_tool_name,
+                                    arguments=arguments
+                                )
+                                
+                                # Report step
+                                if step_callback:
+                                    await step_callback({
+                                        "type": "tool_result",
+                                        "tool_name": tool_name,
+                                        "result": tool_result
+                                    })
+                                
+                                tool_calls.append({
+                                    "id": tool_call["id"],
+                                    "name": tool_name,
+                                    "arguments": arguments,
+                                    "result": tool_result
+                                })
+                            
+                            all_tool_calls.extend(tool_calls)
+                            current_round += 1
+                        else:
+                            # No more tool calls, return final response
+                            return follow_up_text, all_tool_calls
                     
-                    # Get final response
-                    final_payload = {
-                        "model": self.model,
-                        "messages": openai_messages,
-                        "max_tokens": 4096,
-                        "temperature": 0.7
-                    }
-                    
-                    final_response = await self.client.post(
-                        f"{self.base_url}/chat/completions",
-                        json=final_payload
-                    )
-                    final_response.raise_for_status()
-                    final_data = final_response.json()
-                    
-                    final_text = final_data["choices"][0]["message"].get("content", "")
-                    return final_text, tool_calls
+                    # If we hit max rounds, return last response
+                    return follow_up_text, all_tool_calls
             
             return response_text, tool_calls
             
@@ -319,27 +410,55 @@ class OllamaConnector(LLMConnector):
         
         return ollama_tools
     
-    async def generate_response(self, messages: List[Dict], tools: List[Dict] = None, mcp_client: MCPClient = None, mcp_manager: Any = None, step_callback=None) -> Tuple[str, List[Dict]]:
-        """Generate response from Ollama with optional MCP tool support"""
-        
-        # Convert messages to simple format for Ollama
+    def _convert_messages_to_ollama(self, messages: List[Dict]) -> List[Dict]:
+        """Convert chat messages to Ollama format"""
         ollama_messages = []
+        
         for msg in messages:
             role = msg.get("role", "user")
             content = msg.get("content", "")
             
-            # Simplify for Ollama - it may not support complex tool calling yet
-            ollama_messages.append({
-                "role": "assistant" if role == "assistant" else "user",
-                "content": content
-            })
+            # Handle assistant messages with tool calls
+            if role == "assistant" and "tool_calls" in msg and msg["tool_calls"]:
+                # Include tool calls in the message
+                ollama_messages.append({
+                    "role": "assistant",
+                    "content": content if content else "",
+                    "tool_calls": msg["tool_calls"]
+                })
+                
+                # Add tool results if present
+                for tool_call in msg["tool_calls"]:
+                    if "result" in tool_call and "text" in tool_call["result"]:
+                        ollama_messages.append({
+                            "role": "tool",
+                            "content": tool_call["result"]["text"]
+                        })
+            else:
+                # Regular message
+                ollama_messages.append({
+                    "role": role,
+                    "content": content
+                })
+        
+        return ollama_messages
+    
+    async def generate_response(self, messages: List[Dict], tools: List[Dict] = None, mcp_client: MCPClient = None, mcp_manager: Any = None, step_callback=None) -> Tuple[str, List[Dict]]:
+        """Generate response from Ollama with MCP tool support"""
+        
+        # Reset loop detection for new conversation
+        self._reset_loop_detection()
+        
+        # Convert tools and messages to Ollama format
+        ollama_tools = self._convert_mcp_tools_to_ollama(tools) if tools else []
+        ollama_messages = self._convert_messages_to_ollama(messages)
         
         # System message
         has_mcp = bool(mcp_client or mcp_manager)
         if not has_mcp:
-            system_message = "You are an AI assistant. You can have conversations and answer questions, but you don't currently have access to external tools or network infrastructure management capabilities."
+            system_message = SYSTEM_MESSAGE_WITHOUT_MCP
         else:
-            system_message = """You are an AI assistant with access to network infrastructure management tools. When a user requests network operations, explain what you would do and ask them to confirm, since tool integration with Ollama is experimental."""
+            system_message = SYSTEM_MESSAGE_WITH_MCP
         
         # Insert system message at beginning
         ollama_messages.insert(0, {"role": "system", "content": system_message})
@@ -350,7 +469,7 @@ class OllamaConnector(LLMConnector):
             if health_response.status_code != 200:
                 return "Ollama server not accessible. Please ensure Ollama is running on localhost:11434", []
             
-            # Prepare request for Ollama
+            # Initial request with tools
             payload = {
                 "model": self.model,
                 "messages": ollama_messages,
@@ -361,11 +480,15 @@ class OllamaConnector(LLMConnector):
                 }
             }
             
+            # Add tools if available
+            if ollama_tools:
+                payload["tools"] = ollama_tools
+            
             # Notify step callback about reasoning
             if step_callback:
                 await step_callback("🧠 Generating response with Ollama...", "reasoning", {})
             
-            # Make request to Ollama
+            # Make initial request
             response = await self.client.post(
                 f"{self.base_url}/api/chat",
                 json=payload
@@ -373,13 +496,124 @@ class OllamaConnector(LLMConnector):
             response.raise_for_status()
             response_data = response.json()
             
-            response_text = response_data.get("message", {}).get("content", "")
+            message = response_data.get("message", {})
+            response_text = message.get("content", "")
+            tool_calls = []
             
-            # For now, Ollama doesn't have full tool calling support like OpenAI/Anthropic
-            # So we return the text response without tool calls
-            # In the future, this could be enhanced when Ollama adds better function calling
+            # Check for tool calls in the response
+            if message.get("tool_calls"):
+                # Handle multiple rounds of tool calling
+                all_tool_calls = []
+                current_round = 0
+                
+                while current_round < self.max_tool_rounds:
+                    round_tool_calls = []
+                    
+                    for tool_call in message.get("tool_calls", []):
+                        function = tool_call.get("function", {})
+                        tool_name = function.get("name", "")
+                        
+                        # Extract server and actual tool name for multi-server support
+                        if "__" in tool_name:
+                            server_name, actual_tool_name = tool_name.split("__", 1)
+                        else:
+                            server_name = "default"
+                            actual_tool_name = tool_name
+                        
+                        try:
+                            arguments = function.get("arguments", {})
+                            if isinstance(arguments, str):
+                                arguments = json.loads(arguments)
+                        except json.JSONDecodeError:
+                            arguments = {}
+                        
+                        # Report step
+                        if step_callback:
+                            await step_callback(f"⚡ Calling tool: {tool_name}", "tool_call", {
+                                "tool_name": tool_name,
+                                "arguments": arguments
+                            })
+                        
+                        # Check for infinite loops
+                        if self._is_loop_detected(tool_name, arguments):
+                            # Return a message about the loop detection
+                            return f"Loop detected: The same tool call '{tool_name}' with identical arguments was attempted multiple times. Stopping to prevent infinite loop.", all_tool_calls
+                        
+                        # Execute tool with multi-server support
+                        if mcp_manager:
+                            tool_result = await mcp_manager.call_tool(
+                                server_name=server_name,
+                                tool_name=actual_tool_name,
+                                arguments=arguments
+                            )
+                        else:
+                            # Legacy single-client support
+                            tool_result = await self._call_mcp_tool(tool_name, arguments, mcp_client)
+                        
+                        # Report result
+                        if step_callback:
+                            await step_callback({
+                                "type": "tool_result",
+                                "tool_name": tool_name,
+                                "result": tool_result
+                            })
+                        
+                        round_tool_calls.append({
+                            "id": tool_call.get("id", f"call_{datetime.now().timestamp()}"),
+                            "name": tool_name,
+                            "arguments": arguments,
+                            "result": tool_result
+                        })
+                    
+                    all_tool_calls.extend(round_tool_calls)
+                    
+                    # Add assistant message with tool calls
+                    ollama_messages.append({
+                        "role": "assistant",
+                        "content": response_text if current_round == 0 else "",
+                        "tool_calls": message.get("tool_calls", [])
+                    })
+                    
+                    # Add tool results as separate messages
+                    for tc in round_tool_calls:
+                        ollama_messages.append({
+                            "role": "tool",
+                            "content": tc["result"].get("text", "")
+                        })
+                    
+                    # Get next response
+                    follow_up_payload = {
+                        "model": self.model,
+                        "messages": ollama_messages,
+                        "tools": ollama_tools if ollama_tools else None,
+                        "stream": False,
+                        "options": {
+                            "temperature": 0.7,
+                            "num_predict": 4096
+                        }
+                    }
+                    
+                    follow_up_response = await self.client.post(
+                        f"{self.base_url}/api/chat",
+                        json=follow_up_payload
+                    )
+                    follow_up_response.raise_for_status()
+                    follow_up_data = follow_up_response.json()
+                    
+                    message = follow_up_data.get("message", {})
+                    follow_up_text = message.get("content", "")
+                    
+                    # Check for more tool calls
+                    if message.get("tool_calls"):
+                        current_round += 1
+                    else:
+                        # No more tool calls, return final response
+                        return follow_up_text, all_tool_calls
+                
+                # If we hit max rounds, return last response
+                return follow_up_text, all_tool_calls
             
-            return response_text, []
+            return response_text, tool_calls
             
         except Exception as e:
             error_msg = f"Ollama API request failed: {str(e)}"
@@ -487,6 +721,9 @@ class AnthropicConnector(LLMConnector):
             step_callback: Optional callback for step-by-step updates
         """
         
+        # Reset loop detection for new conversation
+        self._reset_loop_detection()
+        
         # Convert tools and messages to Anthropic format
         anthropic_tools = self._convert_mcp_tools_to_anthropic(tools) if tools else []
         anthropic_messages = self._convert_messages_to_anthropic(messages)
@@ -523,6 +760,11 @@ class AnthropicConnector(LLMConnector):
                                 "tool_name": content_block.name,
                                 "arguments": content_block.input
                             })
+                        
+                        # Check for infinite loops
+                        if self._is_loop_detected(content_block.name, content_block.input):
+                            # Return a message about the loop detection
+                            return f"Loop detected: The same tool call '{content_block.name}' with identical arguments was attempted multiple times. Stopping to prevent infinite loop.", tool_calls
                         
                         # Execute MCP tool (if client or manager is available)
                         if mcp_client or mcp_manager:
@@ -593,11 +835,10 @@ class AnthropicConnector(LLMConnector):
                     })
                 
                 # Allow multiple rounds of tool calling
-                max_tool_rounds = 3  # Prevent infinite loops
                 current_round = 0
                 all_tool_calls = tool_calls.copy()
                 
-                while current_round < max_tool_rounds:
+                while current_round < self.max_tool_rounds:
                     # Get response from Claude with tool results
                     follow_up_response = self.client.messages.create(
                         model=self.model,
@@ -620,6 +861,11 @@ class AnthropicConnector(LLMConnector):
                                         "tool_name": content_block.name,
                                         "arguments": content_block.input
                                     })
+                                
+                                # Check for infinite loops
+                                if self._is_loop_detected(content_block.name, content_block.input):
+                                    # Return current state with loop detection message
+                                    return f"Loop detected: The same tool call '{content_block.name}' with identical arguments was attempted multiple times. Stopping to prevent infinite loop.", all_tool_calls
                                 
                                 # Execute additional MCP tool (if client or manager is available)
                                 if mcp_client or mcp_manager:
@@ -701,20 +947,21 @@ class AnthropicConnector(LLMConnector):
                     current_round += 1
                 
                 # If we hit the max rounds, get final response
-                final_response = self.client.messages.create(
-                    model=self.model,
-                    max_tokens=4096,
-                    messages=anthropic_messages,
-                    system=system_message
-                )
-                
-                final_text = ""
-                if hasattr(final_response, 'content'):
-                    for content_block in final_response.content:
-                        if content_block.type == "text":
-                            final_text += content_block.text
-                
-                return final_text, all_tool_calls
+                if current_round >= self.max_tool_rounds:
+                    final_response = self.client.messages.create(
+                        model=self.model,
+                        max_tokens=4096,
+                        messages=anthropic_messages,
+                        system=system_message
+                    )
+                    
+                    final_text = ""
+                    if hasattr(final_response, 'content'):
+                        for content_block in final_response.content:
+                            if content_block.type == "text":
+                                final_text += content_block.text
+                    
+                    return final_text, all_tool_calls
             else:
                 # Extract text from initial response (no tool calls)
                 response_text = ""

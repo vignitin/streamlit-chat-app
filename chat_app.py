@@ -170,6 +170,8 @@ with st.sidebar:
                 help="Select Claude model"
             )
             
+            st.info("ℹ️ Smart loop detection prevents infinite tool calls. No limits on complex infrastructure queries.")
+            
             if st.button("🤖 Connect Anthropic") and anthropic_api_key:
                 try:
                     llm_connector = create_llm_connector(
@@ -201,6 +203,8 @@ with st.sidebar:
                 value="https://api.openai.com/v1",
                 help="OpenAI API base URL - change for Azure OpenAI or compatible endpoints"
             )
+            
+            st.info("ℹ️ Smart loop detection prevents infinite tool calls. No limits on complex infrastructure queries.")
             
             if st.button("🤖 Connect OpenAI") and openai_api_key:
                 try:
@@ -235,6 +239,8 @@ with st.sidebar:
                 value=default_ollama_url,
                 help="Ollama server URL - defaults to host.docker.internal:11434 in Docker, localhost:11434 otherwise"
             )
+            
+            st.info("ℹ️ Tool calling works with models like Llama 3.1, Mistral, and Qwen2.5. Smart loop detection prevents infinite tool calls.")
             
             if st.button("🤖 Connect Ollama"):
                 try:
