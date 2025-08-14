@@ -1,10 +1,15 @@
 import streamlit as st
 import json
 import asyncio
+import os
 from typing import Dict, Any, Optional, List
 from datetime import datetime
+from dotenv import load_dotenv
 from mcp_client import MCPClient, create_mcp_client, extract_mcp_response_text, MCPServerManager
 from llm_connector import create_llm_connector
+
+# Load environment variables
+load_dotenv()
 
 st.set_page_config(
     page_title="MCP Chat Interface",
@@ -120,11 +125,17 @@ with st.sidebar:
         st.write("**Connected Servers:**")
         for server in servers:
             if server.connected:
-                col1, col2 = st.columns([3, 1])
+                col1, col2, col3 = st.columns([3, 1, 1])
                 with col1:
                     st.write(f"🟢 **{server.name}** ({server.url}) - {server.tool_count} tools")
                 with col2:
-                    if st.button("🗑️ Remove", key=f"remove_{server.id}"):
+                    # Show re-auth button only for session-based auth
+                    if server.auth_type == "session":
+                        if st.button("🔄", key=f"reauth_{server.id}", help="Re-authenticate"):
+                            st.session_state[f"show_reauth_{server.id}"] = True
+                            st.rerun()
+                with col3:
+                    if st.button("🗑️", key=f"remove_{server.id}", help="Remove server"):
                         async def remove_server():
                             try:
                                 await st.session_state.mcp_manager.remove_server(server.id)
@@ -133,6 +144,40 @@ with st.sidebar:
                             except Exception as e:
                                 st.error(f"Failed to remove: {str(e)}")
                         asyncio.run(remove_server())
+                
+                # Show re-authentication form if requested
+                if st.session_state.get(f"show_reauth_{server.id}", False):
+                    with st.expander("🔐 Re-authenticate Server", expanded=True):
+                        with st.form(f"reauth_form_{server.id}"):
+                            st.write(f"Re-authenticate to **{server.name}**")
+                            reauth_username = st.text_input("Username", key=f"reauth_username_{server.id}")
+                            reauth_password = st.text_input("Password", type="password", key=f"reauth_password_{server.id}")
+                            reauth_auth_server = st.text_input("Auth Server", key=f"reauth_auth_server_{server.id}")
+                            reauth_auth_port = st.text_input("Auth Port", value="443", key=f"reauth_auth_port_{server.id}")
+                            
+                            col1, col2 = st.columns(2)
+                            with col1:
+                                if st.form_submit_button("Re-authenticate"):
+                                    if reauth_username and reauth_password and reauth_auth_server:
+                                        async def reauthenticate():
+                                            try:
+                                                await st.session_state.mcp_manager.reauthenticate_server(
+                                                    server.id, reauth_username, reauth_password, 
+                                                    reauth_auth_server, reauth_auth_port
+                                                )
+                                                st.success(f"✅ Re-authenticated to {server.name}!")
+                                                st.session_state[f"show_reauth_{server.id}"] = False
+                                                st.rerun()
+                                            except Exception as e:
+                                                st.error(f"❌ Re-authentication failed: {str(e)}")
+                                        asyncio.run(reauthenticate())
+                                    else:
+                                        st.error("Please provide all required fields")
+                            
+                            with col2:
+                                if st.form_submit_button("Cancel"):
+                                    st.session_state[f"show_reauth_{server.id}"] = False
+                                    st.rerun()
     
     # Overall MCP Status
     st.divider()
@@ -151,6 +196,12 @@ with st.sidebar:
     st.divider()
     st.subheader("LLM Configuration")
     
+    # Show info about environment variables
+    if os.path.exists(".env"):
+        st.info("💡 API keys are auto-loaded from .env file if available")
+    else:
+        st.info("💡 Create a .env file from .env.example to auto-load API keys")
+    
     llm_provider = st.selectbox(
         "LLM Provider",
         ["None", "Anthropic", "OpenAI", "Ollama"],
@@ -159,10 +210,13 @@ with st.sidebar:
     
     if llm_provider == "Anthropic":
         with st.expander("Anthropic Settings", expanded=True):
+            # Auto-load API key from environment if available
+            default_anthropic_key = os.getenv("ANTHROPIC_API_KEY", "")
             anthropic_api_key = st.text_input(
                 "Anthropic API Key", 
                 type="password",
-                help="Your Anthropic API key"
+                value=default_anthropic_key,
+                help="Your Anthropic API key (auto-loaded from ANTHROPIC_API_KEY env var if set)"
             )
             anthropic_model = st.selectbox(
                 "Model",
@@ -187,10 +241,15 @@ with st.sidebar:
     
     elif llm_provider == "OpenAI":
         with st.expander("OpenAI Settings", expanded=True):
+            # Auto-load API key and base URL from environment if available
+            default_openai_key = os.getenv("OPENAI_API_KEY", "")
+            default_openai_base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+            
             openai_api_key = st.text_input(
                 "OpenAI API Key", 
                 type="password",
-                help="Your OpenAI API key"
+                value=default_openai_key,
+                help="Your OpenAI API key (auto-loaded from OPENAI_API_KEY env var if set)"
             )
             openai_model = st.selectbox(
                 "Model",
@@ -200,8 +259,8 @@ with st.sidebar:
             
             openai_base_url = st.text_input(
                 "Base URL (Advanced)",
-                value="https://api.openai.com/v1",
-                help="OpenAI API base URL - change for Azure OpenAI or compatible endpoints"
+                value=default_openai_base_url,
+                help="OpenAI API base URL - change for Azure OpenAI or compatible endpoints (auto-loaded from OPENAI_BASE_URL env var if set)"
             )
             
             st.info("ℹ️ Smart loop detection prevents infinite tool calls. No limits on complex infrastructure queries.")
@@ -230,14 +289,17 @@ with st.sidebar:
                 help="Ollama model name (e.g., llama3.1:8b, codellama:7b, mistral:7b)"
             )
             
-            # Default to host.docker.internal when likely running in Docker
-            import os
-            default_ollama_url = "http://host.docker.internal:11434" if os.path.exists("/.dockerenv") else "http://localhost:11434"
+            # Auto-load base URL from environment, with Docker detection fallback
+            env_ollama_url = os.getenv("OLLAMA_BASE_URL")
+            if env_ollama_url:
+                default_ollama_url = env_ollama_url
+            else:
+                default_ollama_url = "http://host.docker.internal:11434" if os.path.exists("/.dockerenv") else "http://localhost:11434"
             
             ollama_base_url = st.text_input(
                 "Base URL (Advanced)",
                 value=default_ollama_url,
-                help="Ollama server URL - defaults to host.docker.internal:11434 in Docker, localhost:11434 otherwise"
+                help="Ollama server URL - defaults to host.docker.internal:11434 in Docker, localhost:11434 otherwise (auto-loaded from OLLAMA_BASE_URL env var if set)"
             )
             
             st.info("ℹ️ Tool calling works with models like Llama 3.1, Mistral, and Qwen2.5. Smart loop detection prevents infinite tool calls.")

@@ -11,4 +11,6 @@ services:
       - /app/__pycache__
     environment:
       - PYTHONUNBUFFERED=1
+    env_file:
+      - .env
     restart: unless-stopped

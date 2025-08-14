@@ -321,6 +321,53 @@ class MCPServerManager:
         if server_id in self.servers:
             del self.servers[server_id]
     
+    async def reauthenticate_server(self, server_id: str, username: str, password: str, 
+                                   auth_server: str, auth_port: str = "443") -> bool:
+        """Re-authenticate an existing server connection"""
+        if server_id not in self.servers:
+            raise ValueError(f"Server {server_id} not found")
+        
+        server = self.servers[server_id]
+        if server.auth_type != "session":
+            raise ValueError(f"Server {server.name} does not use session authentication")
+        
+        # Get existing client or create new one
+        if server_id in self.clients:
+            client = self.clients[server_id]
+        else:
+            client = create_mcp_client(server.url)
+            self.clients[server_id] = client
+        
+        try:
+            # Logout from existing session if any
+            if server.session_token:
+                try:
+                    await client.logout()
+                except:
+                    pass  # Ignore logout errors
+            
+            # Authenticate with new credentials
+            session_token = await client.login(username, password, auth_server, auth_port)
+            server.session_token = session_token
+            
+            # Refresh tools list
+            tools = await client.list_tools()
+            server.connected = True
+            server.tool_count = len(tools)
+            
+            # Update tool mappings
+            self.server_tools[server_id] = tools
+            self._update_tool_mapping(server_id, tools)
+            
+            return True
+            
+        except Exception as e:
+            # Mark as disconnected on failure but keep the server config
+            server.connected = False
+            server.session_token = None
+            server.tool_count = 0
+            raise e
+    
     def _update_tool_mapping(self, server_id: str, tools: List[Dict]):
         """Update tool name to server mapping"""
         # Remove old mappings for this server
