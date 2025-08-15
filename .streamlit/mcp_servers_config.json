@@ -1,0 +1,8 @@
+[
+  {
+    "id": "4e6b63c1",
+    "name": "apstra",
+    "url": "http://host.docker.internal:8080",
+    "auth_type": "session"
+  }
+]
