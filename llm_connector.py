@@ -14,18 +14,25 @@ from mcp_client import MCPClient, MCPServerManager
 # System messages for LLM configuration
 SYSTEM_MESSAGE_WITH_MCP = """You are an AI assistant with access to network infrastructure management tools through MCP (Model Context Protocol). 
 
-When calling tools, some responses may include formatting guidelines or presentation instructions. If formatting guidelines are provided in a tool response:
-- Follow them exactly as specified
-- Use any status icons, table formats, or organization rules provided
-- Apply the guidelines consistently across your response
+IMPORTANT: Formatting Guidelines for Data Presentation
+1. Check if any connected MCP server provides formatting guidelines:
+   - Look for tools named 'formatting_guidelines', 'get_formatting_guidelines', or similar
+   - If available, call this tool FIRST before presenting any data from that server
+   - Apply the formatting rules consistently to all data from that server
 
-If no specific formatting guidelines are provided, present the information in a clear, well-organized manner using:
-- Tables for structured data
-- Appropriate status indicators (✅ ❌ ⚠️ etc.)
-- Logical grouping and sorting of information
-- Summary sections for complex data
+2. When formatting guidelines are available:
+   - Follow them exactly as specified
+   - Use any status icons, table formats, or organization rules provided
+   - Apply the guidelines consistently across your response
 
-Always strive for clear, professional presentation of network infrastructure information."""
+3. If no specific formatting guidelines tool is available:
+   - Present information in a clear, well-organized manner
+   - Use tables for structured data
+   - Apply appropriate status indicators (✅ for good/up, ❌ for bad/down, ⚠️ for warning)
+   - Use logical grouping and sorting
+   - Include summary sections for complex data
+
+Remember: Different MCP servers may have different formatting requirements. Always check for server-specific formatting guidelines before presenting data."""
 
 SYSTEM_MESSAGE_WITHOUT_MCP = """You are an AI assistant. You can have conversations and answer questions, but you don't currently have access to external tools or network infrastructure management capabilities."""
 

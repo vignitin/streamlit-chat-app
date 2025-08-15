@@ -155,53 +155,52 @@ class MCPClient:
                 elif response.status_code == 400 and "Missing session ID" in response.text:
                     # This indicates a StreamableHTTPSessionManager server (like Junos)
                     return await self._list_tools_streamable_http(client)
+                elif response.status_code == 406:
+                    # 406 Not Acceptable - StreamableHTTP server requires Accept header
+                    # Mark this as a streamable server for future requests
+                    self._is_streamable_http = True
+                    return await self._list_tools_streamable_http(client)
                 else:
                     raise Exception(f"Failed to list tools: {response.status_code} - {response.text}")
             except Exception as e:
-                if "Missing session ID" in str(e):
+                if "Missing session ID" in str(e) or "406" in str(e):
                     # Fallback to streamable HTTP protocol
+                    self._is_streamable_http = True
                     return await self._list_tools_streamable_http(client)
                 raise e
     
     async def call_tool(self, tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """Call a specific tool with arguments"""
+        # If we have a session ID, this is a StreamableHTTP server (Junos)
+        if self.mcp_session_id:
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                return await self._call_tool_streamable_http(client, tool_name, arguments)
+        
+        # Otherwise, use the correct format for FastMCP (Apstra)
+        # Authentication is handled via Authorization header, not arguments
         async with httpx.AsyncClient(timeout=60.0) as client:
-            # Try standard HTTP first, fallback to StreamableHTTP if needed
-            try:
-                response = await client.post(
-                    f"{self.server_url}/mcp/v1/call_tool",
-                    json={
-                        "jsonrpc": "2.0",
-                        "method": "tools/call",
-                        "id": f"tool-call-{tool_name}",
-                        "params": {
-                            "name": tool_name,
-                            "arguments": arguments
-                        }
-                    },
-                    headers=self._get_headers()
-                )
-                
-                if response.status_code == 200:
-                    try:
-                        result = response.json()
-                        # Handle JSON-RPC response format
-                        if "result" in result:
-                            return result["result"]
-                        else:
-                            return result
-                    except json.JSONDecodeError as e:
-                        raise Exception(f"Invalid JSON response: {e}")
-                elif response.status_code == 400 and "Missing session ID" in response.text:
-                    # This is a StreamableHTTP server, use that protocol
-                    return await self._call_tool_streamable_http(client, tool_name, arguments)
-                else:
-                    raise Exception(f"Tool call failed: {response.status_code} - {response.text}")
-            except Exception as e:
-                if "Missing session ID" in str(e):
-                    # Fallback to streamable HTTP protocol
-                    return await self._call_tool_streamable_http(client, tool_name, arguments)
-                raise e
+            response = await client.post(
+                f"{self.server_url}/mcp/v1/call_tool",
+                json={
+                    "params": {
+                        "name": tool_name,
+                        **arguments  # Flatten arguments at params level as expected by Apstra
+                    }
+                },
+                headers=self._get_headers()
+            )
+            
+            if response.status_code == 200:
+                try:
+                    result = response.json()
+                    return result
+                except json.JSONDecodeError as e:
+                    raise Exception(f"Invalid JSON response: {e}")
+            elif response.status_code == 400 and "Missing session ID" in response.text:
+                # This is a StreamableHTTP server, use that protocol
+                return await self._call_tool_streamable_http(client, tool_name, arguments)
+            else:
+                raise Exception(f"Tool call failed: {response.status_code} - {response.text}")
     
     async def list_prompts(self) -> List[Dict[str, Any]]:
         """List available prompts from MCP server"""
@@ -256,15 +255,28 @@ class MCPClient:
                 return []
     
     def _get_headers(self) -> Dict[str, str]:
-        """Get headers for requests"""
+        """Get headers for requests - auto-detect if Accept header is needed"""
+        headers = {"Content-Type": "application/json"}
+        
+        # If we already know this is a StreamableHTTP server, include Accept header
+        if self.mcp_session_id is not None or hasattr(self, '_is_streamable_http'):
+            headers["Accept"] = "application/json, text/event-stream"
+        
+        # Add authentication headers if needed
+        if self.session_token:
+            headers["Authorization"] = f"Bearer {self.session_token}"
+            
+        return headers
+    
+    def _get_streamable_headers(self, session_id: Optional[str] = None) -> Dict[str, str]:
+        """Get headers for StreamableHTTP requests (Junos)"""
         headers = {
             "Content-Type": "application/json",
             "Accept": "application/json, text/event-stream"
         }
         
-        # Add authentication headers if needed
-        if self.session_token:
-            headers["Authorization"] = f"Bearer {self.session_token}"
+        if session_id:
+            headers["Mcp-Session-Id"] = session_id
             
         return headers
     
@@ -307,10 +319,7 @@ class MCPClient:
                             }
                         }
                     },
-                    headers={
-                        "Content-Type": "application/json",
-                        "Accept": "application/json, text/event-stream"
-                    },
+                    headers=self._get_streamable_headers(),
                     follow_redirects=True  # Handle 307 redirects
                 )
                 
@@ -345,11 +354,7 @@ class MCPClient:
                                 "method": "notifications/initialized",
                                 "params": {}
                             },
-                            headers={
-                                "Content-Type": "application/json",
-                                "Accept": "application/json, text/event-stream",
-                                "Mcp-Session-Id": self.mcp_session_id
-                            }
+                            headers=self._get_streamable_headers(self.mcp_session_id)
                         )
                         
                         # Wait for initialization to complete
@@ -371,11 +376,7 @@ class MCPClient:
                     "id": "tools-list-streamable",
                     "params": {}
                 },
-                headers={
-                    "Content-Type": "application/json",
-                    "Accept": "application/json, text/event-stream",
-                    "Mcp-Session-Id": self.mcp_session_id
-                }
+                headers=self._get_streamable_headers(self.mcp_session_id)
             )
             
             if tools_response.status_code == 200:
@@ -401,11 +402,7 @@ class MCPClient:
                                         "id": "tools-list-retry",
                                         "params": {}
                                     },
-                                    headers={
-                                        "Content-Type": "application/json",
-                                        "Accept": "application/json, text/event-stream",
-                                        "Mcp-Session-Id": self.mcp_session_id
-                                    }
+                                    headers=self._get_streamable_headers(self.mcp_session_id)
                                 )
                                 
                                 if retry_response.status_code == 200:
@@ -466,11 +463,7 @@ class MCPClient:
                         "arguments": arguments
                     }
                 },
-                headers={
-                    "Content-Type": "application/json",
-                    "Accept": "application/json, text/event-stream",
-                    "Mcp-Session-Id": self.mcp_session_id
-                }
+                headers=self._get_streamable_headers(self.mcp_session_id)
             )
             
             if response.status_code == 200:
@@ -490,6 +483,39 @@ class MCPClient:
                 
         except Exception as e:
             raise Exception(f"StreamableHTTP tool call error: {str(e)}")
+    
+    async def _call_tool_jsonrpc(self, client: httpx.AsyncClient, tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """Handle tool calls using JSON-RPC format"""
+        try:
+            response = await client.post(
+                f"{self.server_url}/mcp/v1/call_tool",
+                json={
+                    "jsonrpc": "2.0",
+                    "method": "tools/call",
+                    "id": f"tool-call-{tool_name}",
+                    "params": {
+                        "name": tool_name,
+                        "arguments": arguments
+                    }
+                },
+                headers=self._get_headers()
+            )
+            
+            if response.status_code == 200:
+                try:
+                    result = response.json()
+                    # Handle JSON-RPC response format
+                    if "result" in result:
+                        return result["result"]
+                    else:
+                        return result
+                except json.JSONDecodeError as e:
+                    raise Exception(f"Invalid JSON response: {e}")
+            else:
+                raise Exception(f"JSON-RPC tool call failed: {response.status_code} - {response.text}")
+                
+        except Exception as e:
+            raise Exception(f"JSON-RPC tool call error: {str(e)}")
     
     async def test_connection(self) -> Dict[str, Any]:
         """Test connection to MCP server"""

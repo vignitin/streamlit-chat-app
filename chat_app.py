@@ -517,6 +517,22 @@ elif st.session_state.current_page == "MCP Inspector":
     with col1:
         st.header("Test Controls")
         
+        # Server selection
+        connected_servers = st.session_state.mcp_manager.get_connected_servers()
+        if not connected_servers:
+            st.error("❌ No MCP servers connected. Please connect a server first.")
+            st.stop()
+        
+        server_names = [f"{server.name} ({server.url})" for server in connected_servers]
+        selected_server_index = st.selectbox(
+            "Select Server to Test",
+            range(len(server_names)),
+            format_func=lambda x: server_names[x]
+        )
+        selected_server = connected_servers[selected_server_index]
+        
+        st.divider()
+        
         test_connection = st.checkbox("Test Connection", value=True)
         test_list_tools = st.checkbox("List Tools", value=True)
         test_call_tool = st.checkbox("Call Tool", value=True)
@@ -524,7 +540,17 @@ elif st.session_state.current_page == "MCP Inspector":
         test_list_resources = st.checkbox("List Resources", value=False)
         
         if test_call_tool:
-            tool_name = st.text_input("Tool Name", value="get_bp", help="Name of the tool to call")
+            # Get available tools for the selected server
+            server_tools = st.session_state.mcp_manager.server_tools.get(selected_server.id, [])
+            tool_names = [tool.get('name', '') for tool in server_tools] if server_tools else []
+            
+            if tool_names:
+                # Use dropdown for available tools
+                selected_tool = st.selectbox("Select Tool to Test", tool_names)
+                tool_name = selected_tool
+            else:
+                # Fallback to text input
+                tool_name = st.text_input("Tool Name", value="get_bp", help="Name of the tool to call")
             tool_args_str = st.text_area(
                 "Tool Arguments (JSON)", 
                 value='{}',
@@ -537,11 +563,11 @@ elif st.session_state.current_page == "MCP Inspector":
             
             async def run_tests():
                 try:
-                    # Create or use existing MCP client
-                    if st.session_state.mcp_client:
-                        client = st.session_state.mcp_client
-                    else:
-                        client = create_mcp_client(server_url)
+                    # Get the client for the selected server
+                    client = st.session_state.mcp_manager.clients.get(selected_server.id)
+                    if not client:
+                        st.error(f"No client found for server {selected_server.name}")
+                        return
                     
                     # Test connection
                     if test_connection:
