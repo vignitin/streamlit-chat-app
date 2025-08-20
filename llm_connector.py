@@ -63,6 +63,16 @@ class LLMConnector:
         """Generate response from LLM with tool calling support"""
         raise NotImplementedError
     
+    async def generate_response_stream(self, messages: List[Dict], tools: List[Dict] = None, mcp_client: MCPClient = None, mcp_manager: Any = None, step_callback=None):
+        """Generate streaming response from LLM (optional)"""
+        # Default implementation falls back to non-streaming
+        response_text, tool_calls = await self.generate_response(messages, tools, mcp_client, mcp_manager)
+        yield {"type": "done", "content": response_text, "tool_calls": tool_calls}
+    
+    def has_streaming_support(self) -> bool:
+        """Check if this connector supports streaming"""
+        return False
+    
     async def _call_mcp_tool(self, tool_name: str, arguments: Dict, mcp_client: MCPClient = None, mcp_manager: Any = None) -> Dict:
         """Call MCP tool and return response"""
         try:
@@ -391,7 +401,100 @@ class OllamaConnector(LLMConnector):
         super().__init__(api_key)
         self.model = model
         self.base_url = base_url
-        self.client = httpx.AsyncClient(timeout=120.0)  # Longer timeout for local models
+        self.client = httpx.AsyncClient(
+            timeout=httpx.Timeout(300.0, connect=30.0),  # 5 minutes for slow devices
+            limits=httpx.Limits(max_keepalive_connections=5, max_connections=10)
+        )  # Longer timeout for local models with connection limits
+    
+    async def generate_response_stream(self, messages: List[Dict], tools: List[Dict] = None, mcp_client: MCPClient = None, mcp_manager: Any = None, step_callback=None):
+        """Generate streaming response from Ollama with real-time updates"""
+        
+        # Reset loop detection for new conversation
+        self._reset_loop_detection()
+        
+        # Convert tools and messages to Ollama format
+        ollama_tools = self._convert_mcp_tools_to_ollama(tools) if tools else []
+        ollama_messages = self._convert_messages_to_ollama(messages)
+        
+        # System message
+        has_mcp = bool(mcp_client or mcp_manager)
+        if not has_mcp:
+            system_message = SYSTEM_MESSAGE_WITHOUT_MCP
+        else:
+            system_message = SYSTEM_MESSAGE_WITH_MCP
+        
+        # Insert system message at beginning
+        ollama_messages.insert(0, {"role": "system", "content": system_message})
+        
+        try:
+            # Check if Ollama server is accessible
+            health_response = await self.client.get(f"{self.base_url}/api/tags")
+            if health_response.status_code != 200:
+                yield {"type": "error", "content": "Ollama server not accessible. Please ensure Ollama is running and accessible."}
+                return
+            
+            # Initial request with tools and streaming enabled
+            payload = {
+                "model": self.model,
+                "messages": ollama_messages,
+                "stream": True,  # Enable streaming
+                "options": {
+                    "temperature": 0.7,
+                    "num_predict": 4096
+                }
+            }
+            
+            # Add tools if available
+            if ollama_tools:
+                payload["tools"] = ollama_tools
+            
+            # Notify step callback about reasoning
+            if step_callback:
+                await step_callback("Generating response with Ollama...", "reasoning", {})
+            
+            # Make streaming request
+            async with self.client.stream("POST", f"{self.base_url}/api/chat", json=payload) as response:
+                response.raise_for_status()
+                
+                accumulated_content = ""
+                
+                async for line in response.aiter_lines():
+                    if line:
+                        try:
+                            chunk_data = json.loads(line)
+                            
+                            if "message" in chunk_data and "content" in chunk_data["message"]:
+                                content = chunk_data["message"]["content"]
+                                accumulated_content += content
+                                
+                                # Yield the incremental content
+                                yield {
+                                    "type": "content", 
+                                    "content": content,
+                                    "accumulated": accumulated_content
+                                }
+                            
+                            # Check if done
+                            if chunk_data.get("done", False):
+                                yield {
+                                    "type": "done",
+                                    "content": accumulated_content
+                                }
+                                break
+                                
+                        except json.JSONDecodeError:
+                            continue  # Skip malformed JSON
+            
+        except httpx.ConnectError as e:
+            yield {"type": "error", "content": f"Ollama connection failed: Cannot connect to {self.base_url}. Please ensure Ollama is running and accessible."}
+        except httpx.TimeoutException as e:
+            yield {"type": "error", "content": f"Ollama request timed out: The server at {self.base_url} took too long to respond."}
+        except Exception as e:
+            yield {"type": "error", "content": f"Ollama API request failed: {str(e)} (Type: {type(e).__name__})"}
+            
+    def has_streaming_support(self) -> bool:
+        """Check if this connector supports streaming"""
+        return True
     
     def _convert_mcp_tools_to_ollama(self, mcp_tools: List[Dict]) -> List[Dict]:
         """Convert MCP tool definitions to Ollama function format"""
@@ -622,8 +725,14 @@ class OllamaConnector(LLMConnector):
             
             return response_text, tool_calls
             
+        except httpx.ConnectError as e:
+            error_msg = f"Ollama connection failed: Cannot connect to {self.base_url}. Please ensure Ollama is running and accessible."
+            return error_msg, []
+        except httpx.TimeoutException as e:
+            error_msg = f"Ollama request timed out: The server at {self.base_url} took too long to respond."
+            return error_msg, []
         except Exception as e:
-            error_msg = f"Ollama API request failed: {str(e)}"
+            error_msg = f"Ollama API request failed: {str(e)} (Type: {type(e).__name__})"
             return error_msg, []
 
 class AnthropicConnector(LLMConnector):
